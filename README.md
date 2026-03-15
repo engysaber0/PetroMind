@@ -22,6 +22,7 @@
 | 🔮 **Predict** | LSTM / 1D-CNN models estimate failure probability & Remaining Useful Life |
 | 🔍 **Retrieve** | RAG engine finds similar historical work orders + relevant manual sections |
 | 🗣️ **Explain** | LLM synthesizes retrieved context into a plain-language diagnosis & action |
+| 💬 **Chat** | Conversational assistant — ask anything, get grounded answers with full session memory |
 | 🔁 **Learn** | Retrains on completed work orders — gets smarter every maintenance cycle |
 
 ---
