@@ -29,7 +29,7 @@
 
 ## 1. Project Overview
 
-**PetroMind** is an end-to-end industrial predictive maintenance and knowledge integration system. It continuously monitors sensor data from industrial machines (vibration, temperature, pressure, current, flow), predicts failure risk and Remaining Useful Life (RUL), and enriches its output with a Retrieval-Augmented Generation (RAG) knowledge layer that retrieves relevant historical work orders, equipment manuals, and technical documents.
+**PetroMind** is an end-to-end industrial predictive maintenance and knowledge integration system. It continuously monitors sensor data from industrial machines (vibration, temperature, pressure, current, flow), predicts failure risk and Remaining Useful Life (RUL), and enriches its output with a Retrieval-Augmented Generation (RAG) knowledge layer that retrieves relevant historical work orders, equipment manuals, and technical documents. Engineers interact with this knowledge layer through a **conversational AI chatbot** — asking questions in natural language, getting context-aware answers grounded in real maintenance history and technical documentation, with full conversation memory across follow-up questions.
 
 **Who uses it:**
 - Maintenance engineers who respond to machine alerts and need actionable recommendations
@@ -104,6 +104,7 @@ graph LR
         UC11["Configure Machines & Alert Thresholds"]
         UC12["Manage Users"]
         UC13["Trigger Model Retraining"]
+        UC14["Chat with Knowledge Assistant"]
     end
 
     ME --> UC1
@@ -113,6 +114,7 @@ graph LR
     ME --> UC5
     ME --> UC6
     ME --> UC7
+    ME --> UC14
 
     SME -->|"inherits all Maintenance<br/>Engineer use cases"| ME
     SME --> UC11
@@ -286,6 +288,19 @@ graph LR
 
 ---
 
+### UC14 — Chat with Knowledge Assistant
+
+| Field | Detail |
+|---|---|
+| **Actor** | Maintenance Engineer, Senior Maintenance Engineer |
+| **Trigger** | Engineer opens the chat interface — either from an active alert or independently |
+| **Precondition** | RAG knowledge base is populated (work orders + documents); LLM is accessible |
+| **Main Flow** | 1. Engineer types a question (e.g., "What's wrong with pump M-001?" or "How do I fix a bearing failure?"). 2. System embeds the query and retrieves relevant work orders and manual chunks from the vector DB. 3. System builds a prompt containing conversation history + retrieved context + new question. 4. LLM generates a grounded, context-aware response. 5. Response and sources are displayed to the engineer. 6. Engineer can ask follow-up questions — conversation history is maintained throughout the session. |
+| **Outcome** | Engineer gets accurate, sourced answers in natural language with full conversational context |
+| **Alternate Flow** | If LLM is unavailable, system returns raw retrieved chunks with a note that the explanation service is down |
+
+---
+
 ## 7. User Stories
 
 ### Maintenance Engineer
@@ -296,6 +311,7 @@ graph LR
 - As a maintenance engineer, I want to retrieve similar historical work orders when I receive an alert, so that I can learn what fixed the same problem in the past.
 - As a maintenance engineer, I want to retrieve relevant sections from equipment manuals, so that I can follow the correct procedure without searching through documents manually.
 - As a maintenance engineer, I want to submit a completed work order with the confirmed failure mode and action taken, so that the system's knowledge base stays up to date.
+- As a maintenance engineer, I want to chat with a knowledge assistant in natural language, so that I can ask questions about machine problems and get grounded answers from historical work orders and manuals without manually searching through documents.
 
 ### Senior Maintenance Engineer
 
@@ -480,6 +496,30 @@ graph LR
 
 ---
 
+### UC14 — Chat with Knowledge Assistant
+
+**Scenario 1 — Successful conversational query:**
+- **Given** the engineer opens the chat interface and types a question
+- **When** the system processes the query
+- **Then** the system returns a natural language answer grounded in retrieved work orders and/or manual sections, with source references, within 5 seconds
+
+**Scenario 2 — Follow-up question with context:**
+- **Given** the engineer has already asked one or more questions in the session
+- **When** the engineer asks a follow-up question
+- **Then** the system uses the full conversation history to generate a contextually accurate response without losing prior context
+
+**Scenario 3 — LLM unavailable:**
+- **Given** the LLM service is down
+- **When** the engineer sends a message
+- **Then** the system returns the raw retrieved chunks with a note: "Explanation service is currently unavailable"
+
+**Scenario 4 — No relevant knowledge found:**
+- **Given** the query does not match anything in the vector DB
+- **When** retrieval returns empty results
+- **Then** the system responds: "No relevant records found in the knowledge base for this query"
+
+---
+
 ## 9. Functional Requirements
 
 ### 9.1 Grouped by Use Case
@@ -535,8 +575,14 @@ graph LR
 - The system shall allow Senior Maintenance Engineers to configure alert thresholds per machine or globally.
 - The system shall support user creation and role assignment (Maintenance Engineer, Operations Supervisor).
 
-#### Model Retraining (UC13)
-- The system shall support periodic automatic retraining triggered by a configurable schedule.
+#### Conversational Knowledge Assistant (UC14)
+- The system shall provide a chat interface accessible from the engineer dashboard.
+- The system shall embed the engineer's query and retrieve relevant work orders and document chunks from the vector DB.
+- The system shall maintain conversation history within a session and include it in every LLM prompt.
+- The system shall build each LLM prompt as: `system_prompt + conversation_history + retrieved_context + new_message`.
+- The system shall return the LLM response alongside source references (work order IDs, document section names).
+- The system shall handle LLM unavailability gracefully by returning raw retrieved chunks with an error note.
+- The system shall expose a `POST /chat` endpoint accepting `session_id`, `message`, and optional `machine_id` context.
 - The system shall support manual retraining initiated by the Senior Maintenance Engineer.
 - The system shall evaluate retrained models before promotion using a holdout test set.
 - The system shall split training data by time or by asset — never by random sampling — to prevent data leakage.
@@ -587,6 +633,7 @@ graph LR
 - FR-I3: The system shall expose a `POST /work-order` endpoint to submit completed work orders.
 - FR-I4: The system shall expose a `GET /fleet` endpoint returning fleet health summary.
 - FR-I5: The system shall expose a `GET /machine/{id}` endpoint returning full machine health details.
+- FR-I6: The system shall expose a `POST /chat` endpoint accepting `session_id`, `message`, and optional `machine_id`, returning an LLM-generated response with source references.
 
 ---
 
@@ -625,6 +672,7 @@ graph LR
 | **RAG API** | FastAPI | Exposes `/retrieve` endpoint |
 | **Alert Engine** | Internal service | Evaluates thresholds and dispatches alerts |
 | **Dashboard / Frontend** | To be defined | Engineer and supervisor UI |
+| **Conversational Chat API** | FastAPI + LLM | Maintains session history, builds RAG-grounded prompts, returns natural language responses via `POST /chat` |
 | **Experiment Tracking** | MLflow / W&B (optional) | Tracks model training runs and metrics |
 | **Containerization** | Docker | Packages and deploys all components |
 
@@ -764,6 +812,20 @@ flowchart TD
     D --> E["Add metadata<br/>equipment type, manufacturer, section"]
     E --> F["Embed chunks<br/>sentence-transformers"]
     F --> G["Store in Vector DB<br/>Chroma / Qdrant"]
+```
+
+### 11.5 Conversational Chat Flow
+
+```mermaid
+flowchart TD
+    A["Engineer sends message<br/>via chat interface"] --> B["Embed query<br/>sentence-transformers"]
+    B --> C["Vector DB search<br/>work orders + documents"]
+    C --> D["Retrieve top-N chunks<br/>with source metadata"]
+    D --> E["Build LLM prompt<br/>system_prompt + conversation_history<br/>+ retrieved_context + new_message"]
+    E --> F["LLM generates response"]
+    F --> G["Return response + source references<br/>to engineer"]
+    G --> H["Append to conversation history<br/>for next turn"]
+    H -->|"Engineer asks follow-up"| A
 ```
 
 ---
