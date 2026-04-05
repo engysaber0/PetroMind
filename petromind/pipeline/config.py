@@ -44,6 +44,16 @@ class PipelineConfig:
     # ── Flat-sensor removal ───────────────────────────────────────────
     flat_sensor_std_threshold: float = 0.01
 
+    # ── Training ──────────────────────────────────────────────────────
+    epochs: int = 50
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    hidden_dim: int = 64
+    n_lstm_layers: int = 2
+    dropout: float = 0.3
+    early_stop_patience: int = 8
+    model_dir: str = "checkpoints"
+
     @property
     def feature_cols(self) -> List[str]:
         """Columns treated as raw input features (op-settings + sensors)."""

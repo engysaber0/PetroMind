@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Convenience entry-point to run the full PetroMind pipeline demo.
+Convenience entry-point to run the full PetroMind pipeline: data prep + training.
 
 Usage:
     python run_pipeline.py                           # synthetic data (no files needed)
     python run_pipeline.py --data data/csv/train_1.csv   # real C-MAPSS CSV
+    python run_pipeline.py --no-train                # data prep only, skip training
+    python run_pipeline.py --epochs 100 --lr 0.001   # custom training params
 
 All parameters are configurable via command-line flags.
 Run ``python run_pipeline.py --help`` for the full list.
@@ -17,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 from petromind.pipeline import (
     PipelineConfig,
@@ -26,6 +29,8 @@ from petromind.pipeline import (
     compute_rul,
     validate_dataframe,
     FeatureExtractor,
+    DualHeadLSTM,
+    Trainer,
 )
 from petromind.pipeline.utils import get_active_feature_cols, load_cmapss_train
 
@@ -62,23 +67,41 @@ def make_synthetic_cmapss(
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Run the PetroMind windowing + feature-engineering pipeline."
+        description="Run the PetroMind pipeline: data prep + model training."
     )
-    p.add_argument(
+    # ── Data ──────────────────────────────────────────────────────────
+    g = p.add_argument_group("data")
+    g.add_argument(
         "--data", type=str, default=None,
         help="Path to a C-MAPSS training file (txt/csv/xlsx). "
              "If omitted, synthetic data is generated.",
     )
-    p.add_argument("--window-size", type=int, default=30)
-    p.add_argument("--stride", type=int, default=1)
-    p.add_argument("--prediction-horizon", type=int, default=30)
-    p.add_argument("--rul-clip", type=int, default=125)
-    p.add_argument("--val-ratio", type=float, default=0.2)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--n-engines", type=int, default=20,
+    g.add_argument("--n-engines", type=int, default=20,
                    help="Number of synthetic engines (only when --data is omitted).")
-    p.add_argument("--pca-components", type=int, default=3)
-    p.add_argument("--fft-top-k", type=int, default=5)
+
+    # ── Pipeline ──────────────────────────────────────────────────────
+    g = p.add_argument_group("pipeline")
+    g.add_argument("--window-size", type=int, default=30)
+    g.add_argument("--stride", type=int, default=1)
+    g.add_argument("--prediction-horizon", type=int, default=30)
+    g.add_argument("--rul-clip", type=int, default=125)
+    g.add_argument("--val-ratio", type=float, default=0.2)
+    g.add_argument("--batch-size", type=int, default=64)
+    g.add_argument("--pca-components", type=int, default=3)
+    g.add_argument("--fft-top-k", type=int, default=5)
+
+    # ── Training ──────────────────────────────────────────────────────
+    g = p.add_argument_group("training")
+    g.add_argument("--no-train", action="store_true",
+                   help="Skip training; only run data preparation.")
+    g.add_argument("--epochs", type=int, default=50)
+    g.add_argument("--lr", type=float, default=1e-3)
+    g.add_argument("--hidden-dim", type=int, default=64)
+    g.add_argument("--n-lstm-layers", type=int, default=2)
+    g.add_argument("--dropout", type=float, default=0.3)
+    g.add_argument("--early-stop-patience", type=int, default=8)
+    g.add_argument("--model-dir", type=str, default="checkpoints")
+
     return p.parse_args(argv)
 
 
@@ -93,6 +116,13 @@ def main(argv=None):
         val_ratio=args.val_ratio,
         batch_size=args.batch_size,
         fft_top_k=args.fft_top_k,
+        epochs=args.epochs,
+        learning_rate=args.lr,
+        hidden_dim=args.hidden_dim,
+        n_lstm_layers=args.n_lstm_layers,
+        dropout=args.dropout,
+        early_stop_patience=args.early_stop_patience,
+        model_dir=args.model_dir,
     )
 
     # Step 1: Load data
@@ -177,9 +207,9 @@ def main(argv=None):
     print(f"  label    : {batch['label'].shape}    dtype={batch['label'].dtype}")
     print(f"  rul      : {batch['rul'].shape}    dtype={batch['rul'].dtype}")
 
-    # Summary
+    # Data prep summary
     print(f"\n{'=' * 60}")
-    print("Pipeline complete")
+    print("Data preparation complete")
     print("=" * 60)
     print(f"  Window size        : {cfg.window_size}")
     print(f"  Stride             : {cfg.stride}")
@@ -189,8 +219,49 @@ def main(argv=None):
     print(f"  Total samples      : {len(ds_raw)}")
     print(f"  Raw feature dim    : {X_raw.shape[1:]}")
     print(f"  Eng. feature dim   : {X_eng.shape[1:]}")
+
+    if args.no_train:
+        print("\n  --no-train flag set. Skipping training.")
+        return
+
+    # ── Step 8: Train the model ───────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print("Step 8 - Train dual-head LSTM (classification + RUL)")
+    print("=" * 60)
+    input_dim = X_raw.shape[2]  # number of features per timestep
+    model = DualHeadLSTM(input_dim=input_dim, cfg=cfg)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Model       : DualHeadLSTM")
+    print(f"  Input dim   : {input_dim}")
+    print(f"  Hidden dim  : {cfg.hidden_dim}")
+    print(f"  LSTM layers : {cfg.n_lstm_layers}")
+    print(f"  Parameters  : {n_params:,}")
+    print(f"  Epochs      : {cfg.epochs}")
+    print(f"  LR          : {cfg.learning_rate}")
+    print(f"  Device      : {'cuda' if torch.cuda.is_available() else 'cpu'}")
     print()
-    print("Ready for model training.  Pass train_loader to your model.")
+
+    trainer = Trainer(model=model, cfg=cfg)
+    history = trainer.fit(train_raw, val_raw)
+
+    # ── Step 9: Final evaluation ──────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print("Step 9 - Final evaluation on validation set")
+    print("=" * 60)
+    val_loss, val_metrics = trainer.evaluate(val_raw)
+    print(f"  Val loss    : {val_loss:.4f}")
+    print(f"  Accuracy    : {val_metrics['accuracy']:.3f}")
+    print(f"  F1 score    : {val_metrics['f1']:.3f}")
+    print(f"  Precision   : {val_metrics['precision']:.3f}")
+    print(f"  Recall      : {val_metrics['recall']:.3f}")
+    print(f"  AUC         : {val_metrics['auc']:.3f}")
+    print(f"  RMSE (RUL)  : {val_metrics['rmse']:.1f}")
+    print(f"  MAE  (RUL)  : {val_metrics['mae']:.1f}")
+    print(f"\n  Best model saved to: {cfg.model_dir}/best_model.pt")
+    print()
+    print("Done. You can load the trained model with:")
+    print(f"  model = DualHeadLSTM(input_dim={input_dim}, cfg=cfg)")
+    print(f"  model.load_state_dict(torch.load('{cfg.model_dir}/best_model.pt'))")
 
 
 if __name__ == "__main__":
