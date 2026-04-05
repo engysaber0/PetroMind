@@ -6,7 +6,7 @@ End-to-end pipeline for industrial predictive maintenance: data preparation, fea
 
 ---
 
-## TODO (Engineer 2)
+## TODO (Engineer 1)
 
 > **Baseline RUL regression** (e.g., XGBoost or Linear Regression) is not yet implemented.
 > Engineer 2's implementation task requires a simple baseline model for RUL prediction
