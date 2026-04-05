@@ -1,20 +1,21 @@
 """
-Tests for model + training pipeline.
+Tests for LSTM RUL model + training pipeline.
 
 Covers:
-    - DualHeadLSTM forward pass shapes
+    - LSTMRULModel forward pass shapes
     - Trainer runs without error for a few epochs
     - Checkpoint save/load round-trip
-    - Metrics computation
+    - Loss decreases during training
 """
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 from petromind.pipeline import (
-    PipelineConfig, DualHeadLSTM, Trainer,
+    PipelineConfig, LSTMRULModel, Trainer,
     build_dataloaders, build_sliding_windows,
     compute_classification_label, compute_rul,
     validate_dataframe,
@@ -28,7 +29,6 @@ def _make_df(n_engines=5, min_life=40, max_life=60, seed=0):
     for uid in range(1, n_engines + 1):
         life = rng.randint(min_life, max_life + 1)
         n = life
-        import pandas as pd
         data = {
             "unit_id": np.full(n, uid, dtype=int),
             "cycle": np.arange(1, n + 1),
@@ -56,19 +56,18 @@ def _prep(cfg):
 class TestModel:
     def test_forward_shapes(self):
         cfg = PipelineConfig(window_size=10, hidden_dim=32, n_lstm_layers=1)
-        model = DualHeadLSTM(input_dim=8, cfg=cfg)
+        model = LSTMRULModel(input_dim=8, cfg=cfg)
         x = torch.randn(4, 10, 8)
-        cls_logit, rul_pred = model(x)
-        assert cls_logit.shape == (4,)
+        rul_pred = model(x)
         assert rul_pred.shape == (4,)
-        assert (rul_pred >= 0).all()  # ReLU on RUL head
+        assert (rul_pred >= 0).all()
 
     def test_forward_different_batch(self):
         cfg = PipelineConfig(window_size=20, hidden_dim=16, n_lstm_layers=1)
-        model = DualHeadLSTM(input_dim=5, cfg=cfg)
+        model = LSTMRULModel(input_dim=5, cfg=cfg)
         for bs in [1, 16, 64]:
-            cls_logit, rul_pred = model(torch.randn(bs, 20, 5))
-            assert cls_logit.shape == (bs,)
+            rul_pred = model(torch.randn(bs, 20, 5))
+            assert rul_pred.shape == (bs,)
 
 
 class TestTrainer:
@@ -80,12 +79,14 @@ class TestTrainer:
         )
         X, y_cls, y_rul, eids = _prep(cfg)
         train_dl, val_dl, _ = build_dataloaders(X, y_cls, y_rul, eids, cfg)
-        model = DualHeadLSTM(input_dim=X.shape[2], cfg=cfg)
+        model = LSTMRULModel(input_dim=X.shape[2], cfg=cfg)
         trainer = Trainer(model=model, cfg=cfg)
         history = trainer.fit(train_dl, val_dl)
         assert len(history["train_loss"]) == 3
         assert len(history["val_loss"]) == 3
         assert all(isinstance(m, dict) for m in history["val_metrics"])
+        assert "rmse" in history["val_metrics"][0]
+        assert "mae" in history["val_metrics"][0]
 
     def test_checkpoint_roundtrip(self, tmp_path):
         cfg = PipelineConfig(
@@ -96,14 +97,14 @@ class TestTrainer:
         X, y_cls, y_rul, eids = _prep(cfg)
         train_dl, val_dl, _ = build_dataloaders(X, y_cls, y_rul, eids, cfg)
 
-        model = DualHeadLSTM(input_dim=X.shape[2], cfg=cfg)
+        model = LSTMRULModel(input_dim=X.shape[2], cfg=cfg)
         trainer = Trainer(model=model, cfg=cfg)
         trainer.fit(train_dl, val_dl)
 
         ckpt_path = tmp_path / "best_model.pt"
         assert ckpt_path.exists()
 
-        model2 = DualHeadLSTM(input_dim=X.shape[2], cfg=cfg)
+        model2 = LSTMRULModel(input_dim=X.shape[2], cfg=cfg)
         model2.load_state_dict(torch.load(ckpt_path, weights_only=True))
         model2.eval()
         model.eval()
@@ -111,8 +112,7 @@ class TestTrainer:
         x = torch.randn(2, cfg.window_size, X.shape[2])
         out1 = model(x)
         out2 = model2(x)
-        torch.testing.assert_close(out1[0], out2[0])
-        torch.testing.assert_close(out1[1], out2[1])
+        torch.testing.assert_close(out1, out2)
 
     def test_loss_decreases(self, tmp_path):
         cfg = PipelineConfig(
@@ -123,7 +123,7 @@ class TestTrainer:
         )
         X, y_cls, y_rul, eids = _prep(cfg)
         train_dl, val_dl, _ = build_dataloaders(X, y_cls, y_rul, eids, cfg)
-        model = DualHeadLSTM(input_dim=X.shape[2], cfg=cfg)
+        model = LSTMRULModel(input_dim=X.shape[2], cfg=cfg)
         trainer = Trainer(model=model, cfg=cfg)
         history = trainer.fit(train_dl, val_dl)
         assert history["train_loss"][-1] < history["train_loss"][0]

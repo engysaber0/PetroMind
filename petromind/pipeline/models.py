@@ -1,11 +1,7 @@
 """
-PyTorch models for predictive maintenance.
+PyTorch model for RUL (Remaining Useful Life) regression.
 
-Two heads share a single LSTM encoder:
-    - **Classification head**: binary (failure within horizon) — sigmoid output
-    - **RUL head**: regression (remaining useful life) — scalar output
-
-The ``DualHeadLSTM`` can be trained jointly or with either head alone.
+An LSTM encoder maps a sensor window (B, W, F) to a scalar RUL prediction.
 """
 from __future__ import annotations
 
@@ -15,8 +11,8 @@ import torch.nn as nn
 from .config import PipelineConfig
 
 
-class DualHeadLSTM(nn.Module):
-    """LSTM encoder with classification + RUL regression heads.
+class LSTMRULModel(nn.Module):
+    """LSTM encoder with a single RUL regression head.
 
     Parameters
     ----------
@@ -39,15 +35,6 @@ class DualHeadLSTM(nn.Module):
         )
         self.dropout = nn.Dropout(cfg.dropout)
 
-        # Classification head  →  P(failure within horizon)
-        self.cls_head = nn.Sequential(
-            nn.Linear(cfg.hidden_dim, cfg.hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.hidden_dim // 2, 1),
-        )
-
-        # RUL regression head  →  estimated remaining cycles
         self.rul_head = nn.Sequential(
             nn.Linear(cfg.hidden_dim, cfg.hidden_dim // 2),
             nn.ReLU(),
@@ -55,7 +42,7 @@ class DualHeadLSTM(nn.Module):
             nn.Linear(cfg.hidden_dim // 2, 1),
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -63,16 +50,13 @@ class DualHeadLSTM(nn.Module):
 
         Returns
         -------
-        cls_logit : Tensor, shape (B,)   — raw logit (apply sigmoid for prob)
-        rul_pred  : Tensor, shape (B,)   — predicted RUL (non-negative via ReLU)
+        rul_pred : Tensor, shape (B,) — predicted RUL (non-negative via ReLU)
         """
-        # LSTM encodes the full sequence; we take the last hidden state
         lstm_out, _ = self.lstm(x)          # (B, W, H)
         h_last = lstm_out[:, -1, :]         # (B, H)
         h_last = self.dropout(h_last)
 
-        cls_logit = self.cls_head(h_last).squeeze(-1)   # (B,)
-        rul_pred = self.rul_head(h_last).squeeze(-1)     # (B,)
-        rul_pred = torch.relu(rul_pred)                  # RUL >= 0
+        rul_pred = self.rul_head(h_last).squeeze(-1)  # (B,)
+        rul_pred = torch.relu(rul_pred)                # RUL >= 0
 
-        return cls_logit, rul_pred
+        return rul_pred

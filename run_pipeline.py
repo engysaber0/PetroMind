@@ -29,7 +29,7 @@ from petromind.pipeline import (
     compute_rul,
     validate_dataframe,
     FeatureExtractor,
-    DualHeadLSTM,
+    LSTMRULModel,
     Trainer,
 )
 from petromind.pipeline.utils import get_active_feature_cols, load_cmapss_train
@@ -224,14 +224,14 @@ def main(argv=None):
         print("\n  --no-train flag set. Skipping training.")
         return
 
-    # ── Step 8: Train the model ───────────────────────────────────────
+    # ── Step 8: Train the LSTM RUL model ─────────────────────────────
     print(f"\n{'=' * 60}")
-    print("Step 8 - Train dual-head LSTM (classification + RUL)")
+    print("Step 8 - Train LSTM RUL regression model")
     print("=" * 60)
-    input_dim = X_raw.shape[2]  # number of features per timestep
-    model = DualHeadLSTM(input_dim=input_dim, cfg=cfg)
+    input_dim = X_raw.shape[2]
+    model = LSTMRULModel(input_dim=input_dim, cfg=cfg)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model       : DualHeadLSTM")
+    print(f"  Model       : LSTMRULModel")
     print(f"  Input dim   : {input_dim}")
     print(f"  Hidden dim  : {cfg.hidden_dim}")
     print(f"  LSTM layers : {cfg.n_lstm_layers}")
@@ -250,17 +250,12 @@ def main(argv=None):
     print("=" * 60)
     val_loss, val_metrics = trainer.evaluate(val_raw)
     print(f"  Val loss    : {val_loss:.4f}")
-    print(f"  Accuracy    : {val_metrics['accuracy']:.3f}")
-    print(f"  F1 score    : {val_metrics['f1']:.3f}")
-    print(f"  Precision   : {val_metrics['precision']:.3f}")
-    print(f"  Recall      : {val_metrics['recall']:.3f}")
-    print(f"  AUC         : {val_metrics['auc']:.3f}")
     print(f"  RMSE (RUL)  : {val_metrics['rmse']:.1f}")
     print(f"  MAE  (RUL)  : {val_metrics['mae']:.1f}")
     print(f"\n  Best model saved to: {cfg.model_dir}/best_model.pt")
     print()
     print("Done. You can load the trained model with:")
-    print(f"  model = DualHeadLSTM(input_dim={input_dim}, cfg=cfg)")
+    print(f"  model = LSTMRULModel(input_dim={input_dim}, cfg=cfg)")
     print(f"  model.load_state_dict(torch.load('{cfg.model_dir}/best_model.pt'))")
 
 

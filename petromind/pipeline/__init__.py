@@ -4,5 +4,5 @@ from .labeling import compute_rul, compute_classification_label
 from .windowing import build_sliding_windows
 from .features import FeatureExtractor
 from .dataset import PredMaintenanceDataset, build_dataloaders
-from .models import DualHeadLSTM
+from .models import LSTMRULModel
 from .trainer import Trainer

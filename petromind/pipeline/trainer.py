@@ -1,16 +1,14 @@
 """
-Training loop for the dual-head LSTM.
+Training loop for the LSTM RUL regression model.
 
 Handles:
-    - Joint training of classification + RUL heads
-    - Per-epoch evaluation with proper metrics
+    - RUL regression training (MSE loss)
+    - Per-epoch evaluation with RMSE and MAE
     - Early stopping on validation loss
     - Best-model checkpoint saving and loading
-    - Class-weight balancing for imbalanced labels
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -20,81 +18,47 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .config import PipelineConfig
-from .models import DualHeadLSTM
+from .models import LSTMRULModel
 
 
 def _compute_metrics(
-    y_true_cls: np.ndarray,
-    y_prob_cls: np.ndarray,
     y_true_rul: np.ndarray,
     y_pred_rul: np.ndarray,
 ) -> Dict[str, float]:
-    """Compute classification + regression metrics without sklearn dependency at import time."""
-    from sklearn.metrics import (
-        accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
-    )
-
-    y_pred_cls = (y_prob_cls >= 0.5).astype(int)
-
-    metrics: Dict[str, float] = {}
-
-    metrics["accuracy"] = float(accuracy_score(y_true_cls, y_pred_cls))
-    metrics["f1"] = float(f1_score(y_true_cls, y_pred_cls, zero_division=0))
-    metrics["precision"] = float(precision_score(y_true_cls, y_pred_cls, zero_division=0))
-    metrics["recall"] = float(recall_score(y_true_cls, y_pred_cls, zero_division=0))
-    try:
-        metrics["auc"] = float(roc_auc_score(y_true_cls, y_prob_cls))
-    except ValueError:
-        metrics["auc"] = 0.0  # only one class present in batch
-
-    rul_diff = y_true_rul - y_pred_rul
-    metrics["rmse"] = float(np.sqrt((rul_diff ** 2).mean()))
-    metrics["mae"] = float(np.abs(rul_diff).mean())
-
-    return metrics
+    """Compute RUL regression metrics."""
+    diff = y_true_rul - y_pred_rul
+    return {
+        "rmse": float(np.sqrt((diff ** 2).mean())),
+        "mae": float(np.abs(diff).mean()),
+    }
 
 
 def _fmt_metrics(m: Dict[str, float]) -> str:
-    parts = [
-        f"Acc={m['accuracy']:.3f}",
-        f"F1={m['f1']:.3f}",
-        f"AUC={m['auc']:.3f}",
-        f"RMSE={m['rmse']:.1f}",
-        f"MAE={m['mae']:.1f}",
-    ]
-    return "  ".join(parts)
+    return f"RMSE={m['rmse']:.1f}  MAE={m['mae']:.1f}"
 
 
 class Trainer:
-    """Trains and evaluates a DualHeadLSTM.
+    """Trains and evaluates an LSTMRULModel.
 
     Parameters
     ----------
-    model : DualHeadLSTM
+    model : LSTMRULModel
     cfg : PipelineConfig
     device : str or torch.device
         ``"cuda"`` or ``"cpu"``.  Auto-detected if ``None``.
-    cls_weight : float or None
-        Weight for the classification loss relative to RUL loss.
-        If None, the two losses are equally weighted.
     """
 
     def __init__(
         self,
-        model: DualHeadLSTM,
+        model: LSTMRULModel,
         cfg: PipelineConfig,
         device: Optional[str] = None,
-        cls_weight: float = 1.0,
-        rul_weight: float = 1.0,
     ):
         self.cfg = cfg
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.model = model.to(self.device)
-
-        self.cls_weight = cls_weight
-        self.rul_weight = rul_weight
 
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -105,8 +69,7 @@ class Trainer:
             self.optimizer, mode="min", factor=0.5, patience=4,
         )
 
-        self.cls_criterion = nn.BCEWithLogitsLoss()
-        self.rul_criterion = nn.MSELoss()
+        self.criterion = nn.MSELoss()
 
         self._best_val_loss = float("inf")
         self._patience_counter = 0
@@ -150,7 +113,6 @@ class Trainer:
                 f"lr={lr:.1e}  {_fmt_metrics(val_metrics)}"
             )
 
-            # Checkpoint best model
             if val_loss < self._best_val_loss:
                 self._best_val_loss = val_loss
                 self._patience_counter = 0
@@ -162,7 +124,6 @@ class Trainer:
                 print(f"  Early stopping at epoch {epoch} (patience={self.cfg.early_stop_patience})")
                 break
 
-        # Reload best weights
         best_path = ckpt_dir / "best_model.pt"
         if best_path.exists():
             self.load(best_path)
@@ -192,14 +153,10 @@ class Trainer:
         n_batches = 0
         for batch in loader:
             X = batch["features"].to(self.device)
-            y_cls = batch["label"].float().to(self.device)
             y_rul = batch["rul"].to(self.device)
 
-            cls_logit, rul_pred = self.model(X)
-
-            loss_cls = self.cls_criterion(cls_logit, y_cls)
-            loss_rul = self.rul_criterion(rul_pred, y_rul)
-            loss = self.cls_weight * loss_cls + self.rul_weight * loss_rul
+            rul_pred = self.model(X)
+            loss = self.criterion(rul_pred, y_rul)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -216,33 +173,23 @@ class Trainer:
         total_loss = 0.0
         n_batches = 0
 
-        all_cls_true, all_cls_prob = [], []
         all_rul_true, all_rul_pred = [], []
 
         for batch in loader:
             X = batch["features"].to(self.device)
-            y_cls = batch["label"].float().to(self.device)
             y_rul = batch["rul"].to(self.device)
 
-            cls_logit, rul_pred = self.model(X)
-
-            loss_cls = self.cls_criterion(cls_logit, y_cls)
-            loss_rul = self.rul_criterion(rul_pred, y_rul)
-            loss = self.cls_weight * loss_cls + self.rul_weight * loss_rul
+            rul_pred = self.model(X)
+            loss = self.criterion(rul_pred, y_rul)
 
             total_loss += loss.item()
             n_batches += 1
 
-            cls_prob = torch.sigmoid(cls_logit).cpu().numpy()
-            all_cls_true.append(y_cls.cpu().numpy())
-            all_cls_prob.append(cls_prob)
             all_rul_true.append(y_rul.cpu().numpy())
             all_rul_pred.append(rul_pred.cpu().numpy())
 
         avg_loss = total_loss / max(n_batches, 1)
         metrics = _compute_metrics(
-            np.concatenate(all_cls_true),
-            np.concatenate(all_cls_prob),
             np.concatenate(all_rul_true),
             np.concatenate(all_rul_pred),
         )

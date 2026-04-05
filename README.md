@@ -1,6 +1,16 @@
 # PetroMind — Predictive Maintenance ML Pipeline
 
-End-to-end pipeline for industrial predictive maintenance: data preparation, feature engineering, and model training for Remaining Useful Life (RUL) prediction and failure classification on sensor time-series data (NASA C-MAPSS format).
+End-to-end pipeline for industrial predictive maintenance: data preparation, feature engineering, and LSTM RUL regression on sensor time-series data (NASA C-MAPSS format).
+
+**Scope:** Engineer 2 (windowing + labeling) and Engineer 4 (RUL-focused features + LSTM/GRU RUL regression).
+
+---
+
+## TODO (Engineer 2)
+
+> **Baseline RUL regression** (e.g., XGBoost or Linear Regression) is not yet implemented.
+> Engineer 2's implementation task requires a simple baseline model for RUL prediction
+> using the windowed features — to be added as a comparison against the LSTM model.
 
 ---
 
@@ -46,8 +56,8 @@ This will:
 1. Generate synthetic C-MAPSS-like sensor data (20 engines by default)
 2. Validate, clean, and label the data
 3. Build sliding windows
-4. Extract engineered features
-5. Train a dual-head LSTM (classification + RUL regression)
+4. Extract engineered features (health indicators, sensor fusion)
+5. Train an LSTM RUL regression model
 6. Evaluate on validation set and save the best model
 
 **With real C-MAPSS data:**
@@ -104,7 +114,7 @@ pytest tests/ -v
 │       ├── windowing.py             # Sliding window builder
 │       ├── features.py              # Feature extraction (stat, FFT, health, PCA)
 │       ├── dataset.py               # PyTorch Dataset & DataLoader + split
-│       ├── models.py                # DualHeadLSTM (classification + RUL heads)
+│       ├── models.py                # LSTMRULModel (RUL regression)
 │       ├── trainer.py               # Training loop, metrics, early stopping
 │       └── example_usage.py         # Standalone demo (data prep only)
 ├── tests/
@@ -118,22 +128,22 @@ pytest tests/ -v
 
 ## Pipeline Steps
 
-| Step | What happens |
-|------|-------------|
-| **1. Load data** | Read C-MAPSS txt/csv/xlsx or generate synthetic data |
-| **2. Validate & clean** | Sort by engine+cycle, impute missing values, remove flat sensors |
-| **3. Label** | Compute RUL per timestep (`max_cycle - cycle`, capped at 125) and binary classification label (`1` if RUL <= horizon) |
-| **4. Window** | Build sliding windows of configurable size/stride per engine |
-| **5. Engineer features** | Extract statistical, signal (RMS, FFT), health indicator, and sensor fusion (PCA) features per window |
-| **6. Split & load** | Time-based train/val split by engine, wrap in PyTorch DataLoaders |
-| **7. Train** | Dual-head LSTM with early stopping, gradient clipping, LR scheduling |
-| **8. Evaluate** | Classification (Accuracy, F1, AUC) + Regression (RMSE, MAE) metrics |
+| Step | What happens | Engineer |
+|------|-------------|----------|
+| **1. Load data** | Read C-MAPSS txt/csv/xlsx or generate synthetic data | — |
+| **2. Validate & clean** | Sort by engine+cycle, impute missing values, remove flat sensors | — |
+| **3. Label** | Compute RUL per timestep (`max_cycle - cycle`, capped at 125) and binary classification label (`1` if RUL <= horizon) | Eng 2 |
+| **4. Window** | Build sliding windows of configurable size/stride per engine | Eng 2 |
+| **5. Engineer features** | Extract statistical, signal (RMS, FFT), health indicator, and sensor fusion (PCA) features per window | Eng 4 |
+| **6. Split & load** | Time-based train/val split by engine, wrap in PyTorch DataLoaders | Eng 2 |
+| **7. Train** | LSTM RUL regression with early stopping, gradient clipping, LR scheduling | Eng 4 |
+| **8. Evaluate** | RUL regression metrics: RMSE, MAE | Eng 4 |
 
 ---
 
-## Model Architecture
+## Model Architecture (Engineer 4)
 
-**DualHeadLSTM** — a shared LSTM encoder with two task-specific heads:
+**LSTMRULModel** — LSTM encoder with a single RUL regression head:
 
 ```
 Input (B, W, F)
@@ -144,22 +154,19 @@ Input (B, W, F)
 │ Encoder  │
 └────┬─────┘
      │ last hidden state (B, H)
+     ▼
+┌──────────┐
+│   RUL    │
+│   Head   │
+│  (Regr)  │
+└────┬─────┘
      │
-     ├──────────────────┐
-     ▼                  ▼
-┌──────────┐     ┌──────────┐
-│   Cls    │     │   RUL    │
-│   Head   │     │   Head   │
-│ (Binary) │     │  (Regr)  │
-└────┬─────┘     └────┬─────┘
-     │                │
-     ▼                ▼
-  P(failure)     Estimated RUL
+     ▼
+  Estimated RUL
 ```
 
-- **Classification head**: predicts P(failure within next N cycles) — BCE loss
-- **RUL head**: predicts remaining useful life in cycles — MSE loss
-- Both heads are trained jointly; the combined loss is `cls_weight * L_cls + rul_weight * L_rul`
+- Predicts remaining useful life in cycles — MSE loss
+- ReLU on output ensures non-negative predictions
 
 ### Training features
 - Adam optimizer with weight decay
@@ -170,14 +177,16 @@ Input (B, W, F)
 
 ---
 
-## How Leakage Is Avoided
+## Engineer 2 — Windowing + Labeling
+
+### How leakage is avoided
 
 - Each window contains **only past cycles** `[t-W+1, ..., t]`
 - Labels come from the **last timestep** of each window
 - Train/val split is **by engine** — no engine appears in both sets
 - Short engines (fewer cycles than window size) are skipped, not zero-padded
 
-## How RUL Is Computed
+### How RUL is computed
 
 ```
 RUL_t = max_cycle(engine) - cycle_t
@@ -185,7 +194,18 @@ RUL_t = max_cycle(engine) - cycle_t
 
 Capped at `rul_clip` (default 125) so the model focuses on the degradation phase rather than predicting large uninformative numbers for healthy engines.
 
-## How Features Improve Model Performance
+### Classification label
+
+```
+label_t = 1  if  RUL_t <= prediction_horizon
+          0  otherwise
+```
+
+Provided for downstream use by Engineer 3 (LSTM/GRU classifier).
+
+---
+
+## Engineer 4 — RUL-Focused Features
 
 | Feature group | What it captures |
 |---------------|-----------------|
@@ -226,13 +246,13 @@ from petromind.pipeline import (
     PipelineConfig, load_cmapss_train, validate_dataframe,
     compute_rul, compute_classification_label,
     build_sliding_windows, FeatureExtractor, build_dataloaders,
-    DualHeadLSTM, Trainer,
+    LSTMRULModel, Trainer,
 )
 from petromind.pipeline.utils import get_active_feature_cols
 
 cfg = PipelineConfig(window_size=50, stride=1, prediction_horizon=30, epochs=100)
 
-# Data prep
+# Data prep (Engineer 2)
 df = load_cmapss_train("data/csv/train_1.csv")
 df = validate_dataframe(df, cfg)
 df = compute_rul(df, cfg)
@@ -242,24 +262,24 @@ feature_cols = get_active_feature_cols(df, cfg)
 X, y_cls, y_rul, engine_ids = build_sliding_windows(df, cfg, feature_cols)
 train_loader, val_loader, dataset = build_dataloaders(X, y_cls, y_rul, engine_ids, cfg)
 
-# Train
-model = DualHeadLSTM(input_dim=X.shape[2], cfg=cfg)
+# Train LSTM RUL model (Engineer 4)
+model = LSTMRULModel(input_dim=X.shape[2], cfg=cfg)
 trainer = Trainer(model=model, cfg=cfg)
 history = trainer.fit(train_loader, val_loader)
 
 # Evaluate
 val_loss, metrics = trainer.evaluate(val_loader)
-print(f"F1={metrics['f1']:.3f}  AUC={metrics['auc']:.3f}  RMSE={metrics['rmse']:.1f}")
+print(f"RMSE={metrics['rmse']:.1f}  MAE={metrics['mae']:.1f}")
 ```
 
 ## Loading a Saved Model
 
 ```python
 import torch
-from petromind.pipeline import PipelineConfig, DualHeadLSTM
+from petromind.pipeline import PipelineConfig, LSTMRULModel
 
 cfg = PipelineConfig()
-model = DualHeadLSTM(input_dim=22, cfg=cfg)
+model = LSTMRULModel(input_dim=22, cfg=cfg)
 model.load_state_dict(torch.load("checkpoints/best_model.pt", weights_only=True))
 model.eval()
 ```
