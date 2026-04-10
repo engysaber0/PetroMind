@@ -67,6 +67,51 @@ def load_cmapss_train(
     raise ValueError(f"Unsupported format: {fmt}")
 
 
+def load_cmapss_excel_all_sheets(
+    path: Union[str, Path],
+    sheet_names: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Load multiple training sheets from a C-MAPSS Excel file and merge them.
+
+    Each sheet contains engines with ``unit_id`` starting from 1.
+    This function offsets the IDs so every engine across all sheets
+    gets a globally unique ``unit_id``.
+
+    Parameters
+    ----------
+    path : path-like
+        Path to the Excel file (e.g., ``All_train_data.xlsx``).
+    sheet_names : list[str] or None
+        Specific sheet names to load.  If None, all sheets are loaded.
+
+    Returns
+    -------
+    pd.DataFrame
+        Combined DataFrame with unique ``unit_id`` across all sheets.
+    """
+    path = Path(path)
+    all_sheets = pd.read_excel(path, sheet_name=sheet_names)
+
+    frames = []
+    uid_offset = 0
+    for sheet_name, df in all_sheets.items():
+        # Standardise column name: 'unit id' -> 'unit_id'
+        if "unit id" in df.columns and "unit_id" not in df.columns:
+            df = df.rename(columns={"unit id": "unit_id"})
+
+        df = df.copy()
+        df["unit_id"] = df["unit_id"] + uid_offset
+        df["dataset"] = sheet_name
+        uid_offset = df["unit_id"].max()
+
+        frames.append(df)
+        print(f"  Loaded sheet '{sheet_name}': {df['unit_id'].nunique()} engines, {len(df)} rows")
+
+    combined = pd.concat(frames, ignore_index=True)
+    print(f"  Total: {combined['unit_id'].nunique()} engines, {len(combined)} rows")
+    return combined
+
+
 def load_cmapss_test(
     test_path: Union[str, Path],
     rul_path: Union[str, Path],

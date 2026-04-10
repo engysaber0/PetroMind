@@ -32,7 +32,7 @@ from petromind.pipeline import (
     LSTMRULModel,
     Trainer,
 )
-from petromind.pipeline.utils import get_active_feature_cols, load_cmapss_train
+from petromind.pipeline.utils import get_active_feature_cols, load_cmapss_train, load_cmapss_excel_all_sheets
 
 
 def make_synthetic_cmapss(
@@ -73,11 +73,16 @@ def parse_args(argv=None):
     g = p.add_argument_group("data")
     g.add_argument(
         "--data", type=str, default=None,
-        help="Path to a C-MAPSS training file (txt/csv/xlsx). "
+        help="Path to a C-MAPSS training file (txt/csv/xlsx single sheet). "
              "If omitted, synthetic data is generated.",
     )
+    g.add_argument(
+        "--excel", type=str, default=None,
+        help="Path to a multi-sheet Excel file (e.g., All_train_data.xlsx). "
+             "All sheets are loaded and merged with unique unit_ids.",
+    )
     g.add_argument("--n-engines", type=int, default=20,
-                   help="Number of synthetic engines (only when --data is omitted).")
+                   help="Number of synthetic engines (only when --data/--excel is omitted).")
 
     # ── Pipeline ──────────────────────────────────────────────────────
     g = p.add_argument_group("pipeline")
@@ -127,13 +132,18 @@ def main(argv=None):
 
     # Step 1: Load data
     print("=" * 60)
-    if args.data:
+    if args.excel:
+        print(f"Step 1 - Load all sheets from {args.excel}")
+        print("=" * 60)
+        raw_df = load_cmapss_excel_all_sheets(args.excel)
+    elif args.data:
         print(f"Step 1 - Load C-MAPSS data from {args.data}")
+        print("=" * 60)
         raw_df = load_cmapss_train(args.data)
     else:
         print(f"Step 1 - Generate synthetic data ({args.n_engines} engines)")
+        print("=" * 60)
         raw_df = make_synthetic_cmapss(n_engines=args.n_engines)
-    print("=" * 60)
     print(f"  Shape   : {raw_df.shape}")
     print(f"  Engines : {raw_df['unit_id'].nunique()}")
     print(f"  Columns : {list(raw_df.columns[:8])} ... ({len(raw_df.columns)} total)")
