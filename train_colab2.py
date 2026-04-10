@@ -224,7 +224,7 @@ def main(argv=None):
             f"RMSE={va_rmse:.1f}  MAE={va_mae:.1f}"
         )
 
-       if va_rmse < best_rmse:
+if va_rmse < best_rmse:
             best_rmse = va_rmse
             no_improve = 0
             torch.save(model.state_dict(), best_path)
@@ -233,7 +233,7 @@ def main(argv=None):
             if no_improve >= args.early_stop_patience:
                 print(f"\n  Early stopping at epoch {epoch} (patience={args.early_stop_patience})")
                 break
-
+              
     model.load_state_dict(torch.load(best_path, map_location=device))
     _, final_rmse, final_mae = run_epoch(model, val_loader, criterion, optimizer, device, train=False)
 
