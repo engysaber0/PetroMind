@@ -17,16 +17,35 @@ Feature groups
 The ``FeatureExtractor`` class is stateless and purely functional: it maps
 (N, W, F_raw) → (N, F_eng).  It can therefore be applied identically to
 train and test sets without any fit/transform asymmetry.
+
+Fix (v2)
+--------
+Skewness and kurtosis are numerically unstable when a sensor is nearly
+constant within a window (std ≈ 0).  scipy internally computes
+``(x - mean)^3 / std^3``; with std ≈ 0 this causes catastrophic
+cancellation and produces NaN / ±Inf that propagate silently through
+training, causing the model to output the mean RUL for every sample.
+
+The fix: detect near-constant windows *per feature* (std < STD_FLOOR),
+suppress the RuntimeWarning, and zero-fill the affected cells after the
+fact.  Zero is a neutral, gradient-safe sentinel — the model sees "no
+higher-moment information here" rather than garbage.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional
+import warnings
+from typing import List
 
 import numpy as np
 from scipy import stats as sp_stats
 
 from .config import PipelineConfig
+
+# Threshold below which a feature's within-window std is treated as
+# "near-constant" and its skew/kurt set to 0.  1e-3 works well for
+# C-MAPSS sensor scales (most sensors operate in 0–1000 range after
+# normalisation, so 1e-3 is effectively zero variance).
+_STD_FLOOR = 1e-3
 
 
 class FeatureExtractor:
@@ -85,13 +104,31 @@ class FeatureExtractor:
 
     @staticmethod
     def _statistical_features(X: np.ndarray) -> np.ndarray:
-        """Per-sensor mean, std, min, max, skewness, kurtosis."""
-        mean = X.mean(axis=1)
-        std = X.std(axis=1)
-        mn = X.min(axis=1)
-        mx = X.max(axis=1)
-        skew = sp_stats.skew(X, axis=1)
-        kurt = sp_stats.kurtosis(X, axis=1)
+        """Per-sensor mean, std, min, max, skewness, kurtosis.
+
+        Near-constant windows (std < _STD_FLOOR) receive skew=0 and
+        kurt=0 rather than numerically unstable / NaN values.
+        """
+        mean = X.mean(axis=1)                     # (N, F)
+        std  = X.std(axis=1)                      # (N, F)
+        mn   = X.min(axis=1)
+        mx   = X.max(axis=1)
+
+        # Mask: True where a (window, feature) cell is near-constant
+        nearly_constant = std < _STD_FLOOR        # (N, F)
+
+        # Suppress the RuntimeWarning — we handle bad cells below
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            skew = sp_stats.skew(X, axis=1)       # (N, F)
+            kurt = sp_stats.kurtosis(X, axis=1)   # (N, F)
+
+        # Zero-fill unstable cells (also catches any residual NaN/Inf)
+        skew[nearly_constant] = 0.0
+        kurt[nearly_constant] = 0.0
+        skew = np.nan_to_num(skew, nan=0.0, posinf=0.0, neginf=0.0)
+        kurt = np.nan_to_num(kurt, nan=0.0, posinf=0.0, neginf=0.0)
+
         return np.concatenate([mean, std, mn, mx, skew, kurt], axis=1)
 
     def _signal_features(self, X: np.ndarray) -> np.ndarray:
@@ -101,21 +138,16 @@ class FeatureExtractor:
 
         fft_vals = np.abs(np.fft.rfft(X, axis=1))  # (N, W//2+1, F)
         # Skip DC component (index 0), take top-k by magnitude
-        fft_vals = fft_vals[:, 1:, :]  # drop DC
+        fft_vals = fft_vals[:, 1:, :]
         k = min(self.cfg.fft_top_k, fft_vals.shape[1])
 
-        # Sort along frequency axis descending and keep top k
         top_k_indices = np.argsort(-fft_vals, axis=1)[:, :k, :]
         top_k = np.take_along_axis(fft_vals, top_k_indices, axis=1)  # (N, k, F)
 
-        # Pad if fewer frequency bins than k
         if k < self.cfg.fft_top_k:
             pad_shape = (N, self.cfg.fft_top_k - k, F)
             top_k = np.concatenate([top_k, np.zeros(pad_shape)], axis=1)
 
-        # Reshape: (N, fft_top_k * F)
-        top_k_flat = top_k.reshape(N, -1)
-        # Interleave so layout is [f0_fft0, f0_fft1, ..., f1_fft0, ...]
         top_k_reordered = top_k.transpose(0, 2, 1).reshape(N, -1)
 
         return np.concatenate([rms, top_k_reordered], axis=1)
@@ -135,20 +167,15 @@ class FeatureExtractor:
 
         tail = X[:, -hw:, :]  # (N, hw, F)
 
-        # Trend slope via least-squares on the tail
         t = np.arange(hw, dtype=np.float32)
         t_mean = t.mean()
         t_var = ((t - t_mean) ** 2).sum()
-        tail_mean_t = tail.mean(axis=1, keepdims=True)  # not used for slope
-        # slope = sum((t - t_mean)*(y - y_mean)) / sum((t - t_mean)^2)
-        # Broadcast t to (1, hw, 1)
         t_bc = t[np.newaxis, :, np.newaxis]
         y_mean = tail.mean(axis=1, keepdims=True)
-        slope = ((t_bc - t_mean) * (tail - y_mean)).sum(axis=1) / (t_var + 1e-9)  # (N, F)
+        slope = ((t_bc - t_mean) * (tail - y_mean)).sum(axis=1) / (t_var + 1e-9)
 
-        # Tail-vs-whole ratio
-        window_mean = X.mean(axis=1)  # (N, F)
-        tail_mean = tail.mean(axis=1)  # (N, F)
+        window_mean = X.mean(axis=1)
+        tail_mean = tail.mean(axis=1)
         ratio = tail_mean / (window_mean + 1e-9)
 
         return np.concatenate([slope, ratio], axis=1)
@@ -170,7 +197,6 @@ class FeatureExtractor:
             xi_centered = xi - xi.mean(axis=0, keepdims=True)
             cov = (xi_centered.T @ xi_centered) / max(W - 1, 1)
             eigvals = np.linalg.eigvalsh(cov)
-            # eigvalsh returns ascending; take last k (largest)
             top_eigvals = eigvals[-k:][::-1]
             out[i, :k] = top_eigvals
 
