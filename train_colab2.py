@@ -78,16 +78,30 @@ def parse_args(argv=None):
 # version here that accepts a custom loss.  If your Trainer already supports
 # a `criterion` argument, pass CompositeLoss() there instead.
 
+def _unpack_batch(batch):
+    """Extract (X, y_rul) from a batch tuple of arbitrary length/types.
+
+    The PetroMind DataLoader may return tuples that include engine_id strings
+    or other metadata alongside the tensors.  We find tensors by type and
+    assume: first float32 3-D tensor = X (windows), last 1-D float tensor =
+    y_rul.  Falls back to positional unpacking if heuristic fails.
+    """
+    tensors = [b for b in batch if isinstance(b, torch.Tensor)]
+    if len(tensors) >= 2:
+        # X is the 3-D window tensor; y_rul is the last 1-D tensor
+        X = next((t for t in tensors if t.dim() == 3), tensors[0])
+        y_rul = next((t for t in reversed(tensors) if t.dim() == 1), tensors[-1])
+        return X, y_rul
+    # Fallback: strip non-tensor items and take first two tensors
+    raise ValueError(f"Cannot unpack batch — found {len(tensors)} tensors in {[type(b) for b in batch]}")
+
+
 def run_epoch(model, loader, criterion, optimizer, device, train: bool):
     model.train(train)
     total_loss, preds_all, targets_all = 0.0, [], []
     with torch.set_grad_enabled(train):
         for batch in loader:
-            # Support both 2-tuple (X, y_rul) and 3-tuple (X, y_cls, y_rul)
-            if len(batch) == 3:
-                X, _, y_rul = batch
-            else:
-                X, y_rul = batch
+            X, y_rul = _unpack_batch(batch)
             X, y_rul = X.to(device, non_blocking=True), y_rul.to(device, non_blocking=True)
 
             pred = model(X).squeeze(-1)
