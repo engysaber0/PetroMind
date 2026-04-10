@@ -84,16 +84,16 @@ def _unpack_batch(batch):
     The PetroMind DataLoader may return tuples that include engine_id strings
     or other metadata alongside the tensors.  We find tensors by type and
     assume: first float32 3-D tensor = X (windows), last 1-D float tensor =
-    y_rul.  Falls back to positional unpacking if heuristic fails.
+    y_rul.  Falls back to positional unpacking if the heuristic fails.
     """
+    if isinstance(batch, dict):
+        return batch["features"], batch["rul"]
     tensors = [b for b in batch if isinstance(b, torch.Tensor)]
     if len(tensors) >= 2:
-        # X is the 3-D window tensor; y_rul is the last 1-D tensor
         X = next((t for t in tensors if t.dim() == 3), tensors[0])
         y_rul = next((t for t in reversed(tensors) if t.dim() == 1), tensors[-1])
         return X, y_rul
-    # Fallback: strip non-tensor items and take first two tensors
-    raise ValueError(f"Cannot unpack batch — found {len(tensors)} tensors in {[type(b) for b in batch]}")
+    raise ValueError(f"Cannot unpack batch: {[type(b) for b in batch]}")
 
 
 def run_epoch(model, loader, criterion, optimizer, device, train: bool):
