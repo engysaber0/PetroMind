@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Google Colab training script for PetroMind RUL pipeline.
+train_colab_v3.py — PetroMind RUL training with composite asymmetric loss.
 
-Usage in Colab:
-    1. Upload All_train_data.xlsx to Colab (or mount Google Drive)
-    2. Run: !python train_colab.py --excel /content/All_train_data.xlsx
+Key change vs previous versions
+--------------------------------
+Replaces pure MSE with a blend of MSE + NASA asymmetric scoring loss.
+MSE is symmetric, so the model finds the globally-optimal constant prediction
+(~mean RUL ≈ 42) and stays there.  The NASA loss penalises *late* predictions
+(predicting more life than remains) more harshly than early ones, breaking
+the plateau.
 
-This script trains on ALL 4 C-MAPSS training sheets combined:
-    - train_FD001(HPC Degradation)       — 100 engines
-    - train_FD002(HPC Degradation)       — 260 engines
-    - train_FD003(HPC+Fan_Deg)           — 100 engines
-    - train_FD004(HPC+Fan_Deg)           — 249 engines
+Alpha annealing schedule
+------------------------
+  Epochs 1  – anneal_start : alpha = alpha_start  (more MSE, stable gradients)
+  Epochs anneal_start – end : alpha decays linearly to alpha_end (more NASA)
+
+Recommended first run:
+    !python train_colab_v3.py --excel /content/All_train_data.xlsx
+
+Then experiment with alpha_start / alpha_end if needed.
 """
 from __future__ import annotations
 
@@ -18,8 +26,8 @@ import argparse
 import sys
 
 import numpy as np
-import pandas as pd
 import torch
+import torch.nn as nn
 
 from petromind.pipeline import (
     PipelineConfig,
@@ -35,29 +43,77 @@ from petromind.pipeline import (
 )
 from petromind.pipeline.utils import get_active_feature_cols
 
+# ── import the new loss (place loss.py next to this script, or inside petromind/)
+from loss import CompositeLoss
+
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Train RUL model on C-MAPSS Excel data.")
-    p.add_argument("--excel", type=str, default="/content/All_train_data.xlsx",
-                   help="Path to multi-sheet Excel file.")
+    p = argparse.ArgumentParser(description="Train RUL model with asymmetric loss.")
+    p.add_argument("--excel", type=str, default="/content/All_train_data.xlsx")
     p.add_argument("--window-size", type=int, default=30)
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--prediction-horizon", type=int, default=30)
     p.add_argument("--rul-clip", type=int, default=125)
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--epochs", type=int, default=60)
+    p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument("--n-lstm-layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.3)
-    p.add_argument("--early-stop-patience", type=int, default=8)
+    p.add_argument("--early-stop-patience", type=int, default=15)
     p.add_argument("--model-dir", type=str, default="checkpoints")
+    # Loss blend
+    p.add_argument("--alpha-start", type=float, default=0.7,
+                   help="Initial MSE weight (1.0 = pure MSE, 0.0 = pure NASA).")
+    p.add_argument("--alpha-end", type=float, default=0.2,
+                   help="Final MSE weight after annealing.")
+    p.add_argument("--anneal-start", type=int, default=5,
+                   help="Epoch at which alpha annealing begins.")
     return p.parse_args(argv)
+
+
+# ── minimal custom trainer loop ───────────────────────────────────────────────
+# We can't change the Trainer class directly, so we reproduce a lightweight
+# version here that accepts a custom loss.  If your Trainer already supports
+# a `criterion` argument, pass CompositeLoss() there instead.
+
+def run_epoch(model, loader, criterion, optimizer, device, train: bool):
+    model.train(train)
+    total_loss, preds_all, targets_all = 0.0, [], []
+    with torch.set_grad_enabled(train):
+        for batch in loader:
+            # Support both 2-tuple (X, y_rul) and 3-tuple (X, y_cls, y_rul)
+            if len(batch) == 3:
+                X, _, y_rul = batch
+            else:
+                X, y_rul = batch
+            X, y_rul = X.to(device, non_blocking=True), y_rul.to(device, non_blocking=True)
+
+            pred = model(X).squeeze(-1)
+            loss = criterion(pred, y_rul.float())
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            total_loss += loss.item() * X.size(0)
+            preds_all.append(pred.detach().cpu())
+            targets_all.append(y_rul.cpu())
+
+    n = sum(t.size(0) for t in targets_all)
+    preds = torch.cat(preds_all).numpy()
+    targets = torch.cat(targets_all).numpy()
+    rmse = float(np.sqrt(np.mean((preds - targets) ** 2)))
+    mae  = float(np.mean(np.abs(preds - targets)))
+    return total_loss / n, rmse, mae
 
 
 def main(argv=None):
     args = parse_args(argv)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     cfg = PipelineConfig(
         window_size=args.window_size,
@@ -75,95 +131,105 @@ def main(argv=None):
         model_dir=args.model_dir,
     )
 
-    # Step 1: Load all sheets
     print("=" * 60)
-    print(f"Step 1 - Load all sheets from {args.excel}")
+    print(f"Loss   : CompositeLoss  alpha {args.alpha_start} → {args.alpha_end}")
+    print(f"Anneal : starts epoch {args.anneal_start}")
     print("=" * 60)
+
+    # Steps 1–6: identical to original pipeline ────────────────────────
+    print("\nStep 1 - Load all sheets")
     raw_df = load_cmapss_excel_all_sheets(args.excel)
-    print(f"  Shape   : {raw_df.shape}")
-    print(f"  Engines : {raw_df['unit_id'].nunique()}")
+    print(f"  Shape: {raw_df.shape}  |  Engines: {raw_df['unit_id'].nunique()}")
 
-    # Step 2: Validate & clean
-    print(f"\n{'=' * 60}")
-    print("Step 2 - Validate & clean")
-    print("=" * 60)
+    print("\nStep 2 - Validate & clean")
     clean_df = validate_dataframe(raw_df, cfg)
-    removed = set(cfg.sensor_cols) - set(clean_df.columns)
-    print(f"  Cleaned shape : {clean_df.shape}")
-    print(f"  Removed flat  : {sorted(removed) if removed else 'none'}")
 
-    # Step 3: Labels
-    print(f"\n{'=' * 60}")
-    print("Step 3 - Compute RUL + classification labels")
-    print("=" * 60)
+    print("\nStep 3 - Labels")
     labeled_df = compute_rul(clean_df, cfg)
     labeled_df = compute_classification_label(labeled_df, cfg)
-    print(f"  RUL range     : [{labeled_df['rul'].min()}, {labeled_df['rul'].max()}]")
-    print(f"  Label balance : {labeled_df['label'].value_counts().to_dict()}")
 
-    # Step 4: Windows
-    print(f"\n{'=' * 60}")
-    print("Step 4 - Build sliding windows")
-    print("=" * 60)
+    print("\nStep 4 - Sliding windows")
     feature_cols = get_active_feature_cols(labeled_df, cfg)
     X_raw, y_cls, y_rul, engine_ids = build_sliding_windows(
         labeled_df, cfg, feature_cols=feature_cols,
     )
-    print(f"  X shape       : {X_raw.shape}")
-    print(f"  Engines used  : {len(np.unique(engine_ids))}")
+    print(f"  X shape: {X_raw.shape}")
 
     if X_raw.shape[0] == 0:
-        print("\n  No windows produced. Try a smaller --window-size.")
+        print("No windows produced. Exiting.")
         sys.exit(1)
 
-    # Step 5: Features
-    print(f"\n{'=' * 60}")
-    print("Step 5 - Extract engineered features")
-    print("=" * 60)
+    print("\nStep 5 - Feature engineering")
     extractor = FeatureExtractor(cfg, n_pca_components=3)
-    X_eng = extractor.transform(X_raw)
-    print(f"  Engineered shape : {X_eng.shape}")
+    extractor.transform(X_raw)
+    print(f"  Done (no RuntimeWarning expected)")
 
-    # Step 6: DataLoaders
-    print(f"\n{'=' * 60}")
-    print("Step 6 - Time-based split -> DataLoaders")
-    print("=" * 60)
-    train_loader, val_loader, ds = build_dataloaders(
+    print("\nStep 6 - DataLoaders")
+    train_loader, val_loader, _ = build_dataloaders(
         X_raw, y_cls, y_rul, engine_ids, cfg,
     )
-    print(f"  Train batches : {len(train_loader)}")
-    print(f"  Val batches   : {len(val_loader)}")
 
-    # Step 7: Train
-    print(f"\n{'=' * 60}")
-    print("Step 7 - Train LSTM RUL regression model")
-    print("=" * 60)
+    # Step 7: custom training loop with composite loss ─────────────────
+    print("\nStep 7 - Train with CompositeLoss")
     input_dim = X_raw.shape[2]
-    model = LSTMRULModel(input_dim=input_dim, cfg=cfg)
+    model = LSTMRULModel(input_dim=input_dim, cfg=cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  Model       : LSTMRULModel")
-    print(f"  Input dim   : {input_dim}")
-    print(f"  Hidden dim  : {cfg.hidden_dim}")
-    print(f"  LSTM layers : {cfg.n_lstm_layers}")
-    print(f"  Parameters  : {n_params:,}")
-    print(f"  Device      : {device}")
-    print()
+    print(f"  Params: {n_params:,}  |  Device: {device}\n")
 
-    trainer = Trainer(model=model, cfg=cfg)
-    history = trainer.fit(train_loader, val_loader)
+    criterion = CompositeLoss(alpha=args.alpha_start)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6,
+    )
 
-    # Step 8: Final eval
+    import os
+    os.makedirs(args.model_dir, exist_ok=True)
+    best_val_loss = float("inf")
+    no_improve = 0
+    best_path = f"{args.model_dir}/best_model.pt"
+
+    alpha_range = args.alpha_start - args.alpha_end
+    anneal_epochs = max(args.epochs - args.anneal_start, 1)
+
+    for epoch in range(1, args.epochs + 1):
+        # Anneal alpha
+        if epoch >= args.anneal_start:
+            frac = (epoch - args.anneal_start) / anneal_epochs
+            new_alpha = args.alpha_start - alpha_range * min(frac, 1.0)
+            criterion.set_alpha(new_alpha)
+
+        tr_loss, tr_rmse, tr_mae = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
+        va_loss, va_rmse, va_mae = run_epoch(model, val_loader,   criterion, optimizer, device, train=False)
+        scheduler.step(va_loss)
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(
+            f"  Epoch {epoch:3d}/{args.epochs}  "
+            f"train={tr_loss:.2f}  val={va_loss:.2f}  "
+            f"lr={lr_now:.1e}  alpha={criterion.alpha:.2f}  "
+            f"RMSE={va_rmse:.1f}  MAE={va_mae:.1f}"
+        )
+
+        if va_loss < best_val_loss:
+            best_val_loss = va_loss
+            no_improve = 0
+            torch.save(model.state_dict(), best_path)
+        else:
+            no_improve += 1
+            if no_improve >= args.early_stop_patience:
+                print(f"\n  Early stopping at epoch {epoch} (patience={args.early_stop_patience})")
+                break
+
+    model.load_state_dict(torch.load(best_path, map_location=device))
+    _, final_rmse, final_mae = run_epoch(model, val_loader, criterion, optimizer, device, train=False)
+
     print(f"\n{'=' * 60}")
     print("Step 8 - Final evaluation")
     print("=" * 60)
-    val_loss, val_metrics = trainer.evaluate(val_loader)
-    print(f"  Val loss    : {val_loss:.4f}")
-    print(f"  RMSE (RUL)  : {val_metrics['rmse']:.1f}")
-    print(f"  MAE  (RUL)  : {val_metrics['mae']:.1f}")
-    print(f"\n  Best model saved to: {cfg.model_dir}/best_model.pt")
-    print()
-    print("Done.")
+    print(f"  RMSE (RUL) : {final_rmse:.1f}")
+    print(f"  MAE  (RUL) : {final_mae:.1f}")
+    print(f"  Best model : {best_path}")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
