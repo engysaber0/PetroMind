@@ -224,8 +224,8 @@ def main(argv=None):
             f"RMSE={va_rmse:.1f}  MAE={va_mae:.1f}"
         )
 
-        if va_loss < best_val_loss:
-            best_val_loss = va_loss
+       if va_rmse < best_rmse:
+            best_rmse = va_rmse
             no_improve = 0
             torch.save(model.state_dict(), best_path)
         else:
