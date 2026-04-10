@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-train_colab_v3.py — PetroMind RUL training with composite asymmetric loss.
+train_colab_v3.py — PetroMind RUL training with operating condition
+normalization + composite asymmetric loss.
 
-Key change vs previous versions
+What's new vs previous versions
 --------------------------------
-Replaces pure MSE with a blend of MSE + NASA asymmetric scoring loss.
-MSE is symmetric, so the model finds the globally-optimal constant prediction
-(~mean RUL ~42) and stays there.  The NASA loss penalises *late* predictions
-(predicting more life than remains) more harshly than early ones, breaking
-the plateau.
+1. Operating condition normalization (Step 2b):
+   Clusters engines by their operational settings (op1/op2/op3) using
+   KMeans, then subtracts the per-cluster sensor mean from every reading.
+   This removes the regime-specific offset so the LSTM sees degradation
+   trends rather than operating-point offsets.  Critical for FD002/FD004
+   which have 6 operating conditions.
 
-Alpha annealing schedule
-------------------------
-  Epochs 1 - anneal_start : alpha = alpha_start  (more MSE, stable gradients)
-  Epochs anneal_start - end : alpha decays linearly to alpha_end (more NASA)
+2. CompositeLoss (MSE + NASA asymmetric scoring):
+   Breaks the MSE plateau by penalising late predictions more heavily.
+   Alpha annealing starts at epoch 30 so MSE can establish a baseline first.
+
+3. RMSE-based early stopping:
+   Composite loss scale changes as alpha anneals, so we track RMSE directly.
 
 Recommended run:
-    !python train_colab_v3.py --excel /content/All_train_data.xlsx \
-        --epochs 80 --alpha-start 0.95 --alpha-end 0.3 --anneal-start 30
+    !python train_colab_v3.py --excel /content/All_train_data.xlsx
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.cluster import KMeans
 
 from petromind.pipeline import (
     PipelineConfig,
@@ -44,7 +48,7 @@ from petromind.pipeline import (
 from petromind.pipeline.utils import get_active_feature_cols
 
 
-# ── Loss definitions (inline — no separate loss.py needed) ────────────────────
+# ── Loss definitions ──────────────────────────────────────────────────────────
 
 class NASAScoringLoss(nn.Module):
     def __init__(self, h_early=10.0, h_late=13.0):
@@ -77,10 +81,42 @@ class CompositeLoss(nn.Module):
         self.alpha = float(max(0.0, min(1.0, alpha)))
 
 
+# ── Operating condition normalization ─────────────────────────────────────────
+
+def normalize_by_operating_condition(df, n_clusters=6, op_cols=None):
+    """Cluster operating conditions and subtract per-cluster sensor means.
+
+    Makes sensor readings comparable across different operating regimes.
+    Safe to call on FD001/FD003 (1 condition) — normalization is harmless
+    and just subtracts the global sensor mean.
+    """
+    if op_cols is None:
+        op_cols = ['op1', 'op2', 'op3']
+
+    op_cols = [c for c in op_cols if c in df.columns]
+    if not op_cols:
+        print("  No op columns found — skipping condition normalization")
+        return df
+
+    print(f"  Clustering on: {op_cols}")
+    df = df.copy()
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    df['_op_cluster'] = kmeans.fit_predict(df[op_cols])
+    sizes = df['_op_cluster'].value_counts().sort_index().to_dict()
+    print(f"  Cluster sizes: {sizes}")
+
+    sensor_cols = [c for c in df.columns if c.startswith('s') and c != '_op_cluster']
+    cluster_means = df.groupby('_op_cluster')[sensor_cols].transform('mean')
+    df[sensor_cols] = df[sensor_cols] - cluster_means
+
+    df.drop(columns=['_op_cluster'], inplace=True)
+    return df
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Train RUL model with asymmetric loss.")
+    p = argparse.ArgumentParser(description="Train RUL model with op-condition norm + asymmetric loss.")
     p.add_argument("--excel", type=str, default="/content/All_train_data.xlsx")
     p.add_argument("--window-size", type=int, default=30)
     p.add_argument("--stride", type=int, default=1)
@@ -95,6 +131,8 @@ def parse_args(argv=None):
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--early-stop-patience", type=int, default=15)
     p.add_argument("--model-dir", type=str, default="checkpoints")
+    p.add_argument("--n-clusters", type=int, default=6,
+                   help="KMeans clusters for operating condition normalization.")
     p.add_argument("--alpha-start", type=float, default=0.95,
                    help="Initial MSE weight (1.0=pure MSE, 0.0=pure NASA).")
     p.add_argument("--alpha-end", type=float, default=0.3,
@@ -173,22 +211,33 @@ def main(argv=None):
     )
 
     print("=" * 60)
-    print(f"Loss   : CompositeLoss  alpha {args.alpha_start} -> {args.alpha_end}")
-    print(f"Anneal : starts epoch {args.anneal_start}")
-    print(f"Device : {device}")
+    print(f"Loss      : CompositeLoss  alpha {args.alpha_start} -> {args.alpha_end}")
+    print(f"Anneal    : starts epoch {args.anneal_start}")
+    print(f"Op norm   : {args.n_clusters} clusters")
+    print(f"Device    : {device}")
     print("=" * 60)
 
+    # Step 1: Load
     print("\nStep 1 - Load all sheets")
     raw_df = load_cmapss_excel_all_sheets(args.excel)
     print(f"  Shape: {raw_df.shape}  |  Engines: {raw_df['unit_id'].nunique()}")
 
+    # Step 2: Validate
     print("\nStep 2 - Validate & clean")
     clean_df = validate_dataframe(raw_df, cfg)
+    print(f"  Cleaned shape: {clean_df.shape}")
 
+    # Step 2b: Operating condition normalization  <-- KEY NEW STEP
+    print("\nStep 2b - Operating condition normalization")
+    clean_df = normalize_by_operating_condition(clean_df, n_clusters=args.n_clusters)
+
+    # Step 3: Labels
     print("\nStep 3 - Labels")
     labeled_df = compute_rul(clean_df, cfg)
     labeled_df = compute_classification_label(labeled_df, cfg)
+    print(f"  RUL range: [{labeled_df['rul'].min()}, {labeled_df['rul'].max()}]")
 
+    # Step 4: Sliding windows
     print("\nStep 4 - Sliding windows")
     feature_cols = get_active_feature_cols(labeled_df, cfg)
     X_raw, y_cls, y_rul, engine_ids = build_sliding_windows(
@@ -200,18 +249,21 @@ def main(argv=None):
         print("No windows produced. Exiting.")
         sys.exit(1)
 
+    # Step 5: Feature engineering
     print("\nStep 5 - Feature engineering")
     extractor = FeatureExtractor(cfg, n_pca_components=3)
     extractor.transform(X_raw)
     print("  Done (no RuntimeWarning expected)")
 
+    # Step 6: DataLoaders
     print("\nStep 6 - DataLoaders")
     train_loader, val_loader, _ = build_dataloaders(
         X_raw, y_cls, y_rul, engine_ids, cfg,
     )
     print(f"  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
 
-    print("\nStep 7 - Train with CompositeLoss")
+    # Step 7: Train
+    print("\nStep 7 - Train with CompositeLoss + op-condition normalization")
     input_dim = X_raw.shape[2]
     model = LSTMRULModel(input_dim=input_dim, cfg=cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -263,6 +315,7 @@ def main(argv=None):
                 print(f"\n  Early stopping at epoch {epoch} (patience={args.early_stop_patience})")
                 break
 
+    # Step 8: Final eval
     model.load_state_dict(torch.load(best_path, map_location=device))
     _, final_rmse, final_mae = run_epoch(
         model, val_loader, criterion, optimizer, device, train=False
