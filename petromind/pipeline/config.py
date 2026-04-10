@@ -44,6 +44,9 @@ class PipelineConfig:
     # ── Flat-sensor removal ───────────────────────────────────────────
     flat_sensor_std_threshold: float = 0.01
 
+    # ── Normalization ─────────────────────────────────────────────────
+    normalize_sensors: bool = True      # per-sensor z-score normalization
+
     # ── Training ──────────────────────────────────────────────────────
     epochs: int = 50
     learning_rate: float = 1e-3

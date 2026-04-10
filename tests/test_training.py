@@ -127,3 +127,88 @@ class TestTrainer:
         trainer = Trainer(model=model, cfg=cfg)
         history = trainer.fit(train_dl, val_dl)
         assert history["train_loss"][-1] < history["train_loss"][0]
+
+
+class TestMetrics:
+    def test_score_asymmetric(self):
+        """NASA score penalizes late predictions more than early ones."""
+        from petromind.pipeline.trainer import _compute_metrics
+
+        # Late predictions (pred > true) should be penalized more
+        y_true = np.array([50.0, 50.0, 50.0])
+        y_pred_late = np.array([70.0, 80.0, 100.0])  # over-estimate
+        y_pred_early = np.array([30.0, 20.0, 0.0])   # under-estimate
+
+        metrics_late = _compute_metrics(y_true, y_pred_late)
+        metrics_early = _compute_metrics(y_true, y_pred_early)
+
+        # Late predictions should have higher (worse) score
+        assert metrics_late["score"] > metrics_early["score"]
+
+    def test_metrics_include_score(self, tmp_path):
+        cfg = PipelineConfig(
+            window_size=10, stride=5, batch_size=32,
+            hidden_dim=16, n_lstm_layers=1, epochs=2,
+            early_stop_patience=10, model_dir=str(tmp_path),
+        )
+        X, y_cls, y_rul, eids = _prep(cfg)
+        train_dl, val_dl, _ = build_dataloaders(X, y_cls, y_rul, eids, cfg)
+        model = LSTMRULModel(input_dim=X.shape[2], cfg=cfg)
+        trainer = Trainer(model=model, cfg=cfg)
+        _, metrics = trainer.evaluate(val_dl)
+        assert "score" in metrics
+
+
+class TestPredictionExport:
+    def test_export_predictions(self, tmp_path):
+        cfg = PipelineConfig(
+            window_size=10, stride=5, batch_size=32,
+            hidden_dim=16, n_lstm_layers=1, epochs=2,
+            early_stop_patience=10, model_dir=str(tmp_path),
+        )
+        X, y_cls, y_rul, eids = _prep(cfg)
+        train_dl, val_dl, _ = build_dataloaders(X, y_cls, y_rul, eids, cfg)
+        model = LSTMRULModel(input_dim=X.shape[2], cfg=cfg)
+        trainer = Trainer(model=model, cfg=cfg)
+        trainer.fit(train_dl, val_dl)
+
+        output_path = tmp_path / "predictions.csv"
+        trainer.export_predictions(val_dl, str(output_path))
+        assert output_path.exists()
+
+        df = pd.read_csv(output_path)
+        assert "true_rul" in df.columns
+        assert "predicted_rul" in df.columns
+        assert "error" in df.columns
+        assert "engine_id" in df.columns
+
+
+class TestSensorNormalizer:
+    def test_normalizer_fit_transform(self):
+        from petromind.pipeline import SensorNormalizer
+
+        X_train = np.random.randn(100, 30, 8)
+        X_val = np.random.randn(50, 30, 8)
+
+        normalizer = SensorNormalizer()
+        X_train_norm = normalizer.fit_transform(X_train)
+        X_val_norm = normalizer.transform(X_val)
+
+        # Normalized train data should have ~0 mean and ~1 std
+        assert np.allclose(X_train_norm.mean(axis=(0, 1)), 0, atol=1e-6)
+        assert np.allclose(X_train_norm.std(axis=(0, 1)), 1, atol=1e-6)
+        assert X_train_norm.shape == X_train.shape
+        assert X_val_norm.shape == X_val.shape
+
+    def test_normalizer_engineered_features(self):
+        from petromind.pipeline import SensorNormalizer
+
+        X_train = np.random.randn(100, 50)  # (N, F_eng)
+        X_val = np.random.randn(50, 50)
+
+        normalizer = SensorNormalizer()
+        X_train_norm = normalizer.fit_transform(X_train)
+        X_val_norm = normalizer.transform(X_val)
+
+        assert np.allclose(X_train_norm.mean(axis=0), 0, atol=1e-6)
+        assert np.allclose(X_train_norm.std(axis=0), 1, atol=1e-6)

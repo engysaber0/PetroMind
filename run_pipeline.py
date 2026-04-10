@@ -31,6 +31,7 @@ from petromind.pipeline import (
     FeatureExtractor,
     LSTMRULModel,
     Trainer,
+    SensorNormalizer,
 )
 from petromind.pipeline.utils import get_active_feature_cols, load_cmapss_train, load_cmapss_excel_all_sheets
 
@@ -63,6 +64,26 @@ def make_synthetic_cmapss(
     df["unit_id"] = df["unit_id"].astype(int)
     df["cycle"] = df["cycle"].astype(int)
     return df
+
+
+def _split_by_engines(
+    X: np.ndarray,
+    engine_ids: np.ndarray,
+    val_ratio: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split data into train/val by engine IDs for normalization fitting.
+
+    Returns
+    -------
+    X_train, X_val : np.ndarray
+        Training and validation subsets.
+    """
+    unique_engines = np.sort(np.unique(engine_ids))
+    n_val = max(1, int(len(unique_engines) * val_ratio))
+    val_engines = set(unique_engines[-n_val:])
+    train_mask = np.array([eid not in val_engines for eid in engine_ids])
+    val_mask = ~train_mask
+    return X[train_mask], X[val_mask]
 
 
 def parse_args(argv=None):
@@ -106,6 +127,10 @@ def parse_args(argv=None):
     g.add_argument("--dropout", type=float, default=0.3)
     g.add_argument("--early-stop-patience", type=int, default=8)
     g.add_argument("--model-dir", type=str, default="checkpoints")
+    g.add_argument("--no-normalize", action="store_true",
+                   help="Disable per-sensor z-score normalization.")
+    g.add_argument("--export-preds", type=str, default=None,
+                   help="Export predictions to CSV at given path.")
 
     return p.parse_args(argv)
 
@@ -128,6 +153,7 @@ def main(argv=None):
         dropout=args.dropout,
         early_stop_patience=args.early_stop_patience,
         model_dir=args.model_dir,
+        normalize_sensors=not args.no_normalize,
     )
 
     # Step 1: Load data
@@ -198,6 +224,15 @@ def main(argv=None):
     print("Step 6 - Time-based split -> PyTorch DataLoaders")
     print("=" * 60)
 
+    # Optional: Normalize sensor data (fit on train, apply to both)
+    if cfg.normalize_sensors:
+        print("  Normalizing sensors (per-feature z-score, fit on train only)")
+        normalizer = SensorNormalizer()
+        X_raw_train, X_raw_val = _split_by_engines(X_raw, engine_ids, cfg.val_ratio)
+        normalizer.fit(X_raw_train)
+        X_raw = normalizer.transform(X_raw)
+        print(f"  Normalized shape: {X_raw.shape}")
+
     train_raw, val_raw, ds_raw = build_dataloaders(
         X_raw, y_cls, y_rul, engine_ids, cfg,
     )
@@ -226,6 +261,7 @@ def main(argv=None):
     print(f"  Prediction horizon : {cfg.prediction_horizon}")
     print(f"  RUL clip           : {cfg.rul_clip}")
     print(f"  Val ratio          : {cfg.val_ratio}")
+    print(f"  Normalize sensors  : {cfg.normalize_sensors}")
     print(f"  Total samples      : {len(ds_raw)}")
     print(f"  Raw feature dim    : {X_raw.shape[1:]}")
     print(f"  Eng. feature dim   : {X_eng.shape[1:]}")
@@ -262,7 +298,16 @@ def main(argv=None):
     print(f"  Val loss    : {val_loss:.4f}")
     print(f"  RMSE (RUL)  : {val_metrics['rmse']:.1f}")
     print(f"  MAE  (RUL)  : {val_metrics['mae']:.1f}")
+    print(f"  Score       : {val_metrics['score']:.1f} (NASA asymmetric)")
     print(f"\n  Best model saved to: {cfg.model_dir}/best_model.pt")
+
+    # ── Step 10: Export predictions (optional) ────────────────────────
+    if args.export_preds:
+        print(f"\n{'=' * 60}")
+        print("Step 10 - Export predictions")
+        print("=" * 60)
+        trainer.export_predictions(val_raw, args.export_preds)
+
     print()
     print("Done. You can load the trained model with:")
     print(f"  model = LSTMRULModel(input_dim={input_dim}, cfg=cfg)")

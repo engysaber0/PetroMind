@@ -23,6 +23,55 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from .config import PipelineConfig
 
 
+class SensorNormalizer:
+    """Per-sensor z-score normalization with train/val separation.
+
+    Computes mean/std from training data only, applies to both train and val.
+    Operates on windowed data of shape (N, W, F) or engineered features (N, F_eng).
+    """
+
+    def __init__(self):
+        self.mean: Optional[np.ndarray] = None
+        self.std: Optional[np.ndarray] = None
+
+    def fit(self, X_train: np.ndarray) -> "SensorNormalizer":
+        """Compute mean/std from training data.
+
+        Parameters
+        ----------
+        X_train : np.ndarray, shape (N, W, F) or (N, F_eng)
+        """
+        if X_train.ndim == 3:
+            # Windowed data: compute per-feature stats across all timesteps
+            self.mean = X_train.mean(axis=(0, 1))  # (F,)
+            self.std = X_train.std(axis=(0, 1)) + 1e-8  # (F,)
+        else:
+            # Engineered features: (N, F_eng)
+            self.mean = X_train.mean(axis=0)  # (F_eng,)
+            self.std = X_train.std(axis=0) + 1e-8  # (F_eng,)
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """Apply normalization.
+
+        Parameters
+        ----------
+        X : np.ndarray, shape (N, ...) matching fit shape
+
+        Returns
+        -------
+        np.ndarray : Normalized data
+        """
+        if self.mean is None or self.std is None:
+            raise RuntimeError("Must call fit() before transform()")
+        return (X - self.mean) / self.std
+
+    def fit_transform(self, X_train: np.ndarray) -> np.ndarray:
+        """Fit on training data and transform it."""
+        self.fit(X_train)
+        return self.transform(X_train)
+
+
 class PredMaintenanceDataset(Dataset):
     """PyTorch Dataset wrapping windowed maintenance data.
 

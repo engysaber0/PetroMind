@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -25,16 +26,36 @@ def _compute_metrics(
     y_true_rul: np.ndarray,
     y_pred_rul: np.ndarray,
 ) -> Dict[str, float]:
-    """Compute RUL regression metrics."""
+    """Compute RUL regression metrics.
+
+    Includes:
+    - RMSE, MAE: Standard regression metrics
+    - Score: NASA's asymmetric scoring function (penalizes late predictions more)
+    """
     diff = y_true_rul - y_pred_rul
-    return {
+    metrics = {
         "rmse": float(np.sqrt((diff ** 2).mean())),
         "mae": float(np.abs(diff).mean()),
     }
 
+    # NASA scoring function: asymmetric penalty
+    # Late predictions (pred > true) are penalized more heavily than early ones
+    # Score = sum(exp(-a_i * diff_i) - 1) where:
+    #   a_i = 1/13 if diff < 0 (under-estimate, early warning)
+    #   a_i = 1/10 if diff >= 0 (over-estimate, late warning - more penalized)
+    score = 0.0
+    for d in diff:
+        if d < 0:  # predicted RUL > actual (late prediction - dangerous)
+            score += np.exp(-d / 10.0) - 1
+        else:  # predicted RUL < actual (early prediction - safer)
+            score += np.exp(d / 13.0) - 1
+    metrics["score"] = float(score)
+
+    return metrics
+
 
 def _fmt_metrics(m: Dict[str, float]) -> str:
-    return f"RMSE={m['rmse']:.1f}  MAE={m['mae']:.1f}"
+    return f"RMSE={m['rmse']:.1f}  MAE={m['mae']:.1f}  Score={m['score']:.1f}"
 
 
 class Trainer:
@@ -194,3 +215,58 @@ class Trainer:
             np.concatenate(all_rul_pred),
         )
         return avg_loss, metrics
+
+    @torch.no_grad()
+    def predict(self, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Generate predictions for a DataLoader.
+
+        Returns
+        -------
+        y_true_rul, y_pred_rul, engine_ids : np.ndarray
+            True RUL values, predicted RUL values, and engine IDs.
+        """
+        self.model.eval()
+        all_rul_true, all_rul_pred, all_engine_ids = [], [], []
+
+        for batch in loader:
+            X = batch["features"].to(self.device)
+            y_rul = batch["rul"].to(self.device)
+            engine_ids = batch.get("engine_ids", np.array([]))
+
+            rul_pred = self.model(X)
+
+            all_rul_true.append(y_rul.cpu().numpy())
+            all_rul_pred.append(rul_pred.cpu().numpy())
+            if len(engine_ids) > 0:
+                all_engine_ids.append(engine_ids.cpu().numpy() if isinstance(engine_ids, torch.Tensor) else engine_ids)
+
+        y_true = np.concatenate(all_rul_true)
+        y_pred = np.concatenate(all_rul_pred)
+        eng_ids = np.concatenate(all_engine_ids) if all_engine_ids else np.arange(len(y_true))
+
+        return y_true, y_pred, eng_ids
+
+    def export_predictions(
+        self,
+        loader: DataLoader,
+        output_path: str,
+    ) -> None:
+        """Export model predictions to CSV.
+
+        Parameters
+        ----------
+        loader : DataLoader
+            Data to predict on.
+        output_path : str
+            Path to output CSV file.
+        """
+        y_true, y_pred, engine_ids = self.predict(loader)
+
+        df = pd.DataFrame({
+            "engine_id": engine_ids,
+            "true_rul": y_true,
+            "predicted_rul": y_pred,
+            "error": y_pred - y_true,
+        })
+        df.to_csv(output_path, index=False)
+        print(f"  Predictions exported to: {output_path}")
